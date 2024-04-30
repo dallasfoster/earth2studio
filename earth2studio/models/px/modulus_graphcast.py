@@ -162,6 +162,20 @@ class ModulusGraphcast(torch.nn.Module, AutoModelMixin, PrognosticMixin):
     def __str__(self) -> str:
         return "modulus_graphcast_73ch"
 
+    def to(self, device: str | torch.device | int) -> PrognosticModel:
+        """Move model to device"""
+        device = torch.device(device)
+        if device.index is None:
+            if device.type == "cuda":
+                device = torch.device(device.type, torch.cuda.current_device())
+            else:
+                device = torch.device(device.type, 0)
+
+        super().to(device)
+        self.model.to(device)
+
+        return self
+
     @classmethod
     def load_model(
         cls,
