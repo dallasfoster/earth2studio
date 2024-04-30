@@ -137,6 +137,8 @@ class ModulusGraphcast(torch.nn.Module, AutoModelMixin, PrognosticMixin):
 
         lat = np.linspace(90.0, -90.0, 721)
         lon = np.linspace(0, 360, 1440, endpoint=False)
+        self.LON, self.LAT = np.meshgrid(lon, lat)
+
         self.input_coords = OrderedDict(
             {
                 "time": np.empty(1),
@@ -160,27 +162,6 @@ class ModulusGraphcast(torch.nn.Module, AutoModelMixin, PrognosticMixin):
     def __str__(self) -> str:
         return "modulus_graphcast_73ch"
 
-    def get_cosine_zenith_fields(
-        self,
-        times: np.array,
-        lead_time: np.timedelta,
-        longrid: np.array,
-        latgrid: np.array,
-        device: torch.device | str = "cuda",
-    ) -> torch.Tensor:
-        """Creates cosine zenith fields for input time array"""
-        output = []
-        for time in timearray_to_datetime(times):
-            uvcossza = cos_zenith_angle(
-                time + lead_time,
-                longrid.cpu,
-                latgrid.cpu,
-            )
-            # Normalize
-            uvcossza = torch.as_tensor(uvcossza, device=device, dtype=torch.float32)
-            output.append(uvcossza)
-        return torch.stack(output, axis=0)
-
     @classmethod
     def load_model(
         cls,
@@ -188,7 +169,41 @@ class ModulusGraphcast(torch.nn.Module, AutoModelMixin, PrognosticMixin):
     ) -> PrognosticModel:
         """Load prognostic from package"""
 
-        model = Module.from_checkpoint(package.get("model.mdlus"))
+        # Download and cache the checkpoint file if needed
+        import json
+        import tarfile
+        import tempfile
+
+        cached_model_file = package.get("model.mdlus")
+        cached_icospheres = package.get("icospheres.json")
+        cached_static = package.get("static")
+        # Use a temporary directory to extract the tar file
+        with tempfile.TemporaryDirectory() as temp_dir:
+            from pathlib import Path
+
+            local_path = Path(temp_dir)
+
+            # Open the tar file and extract its contents to the temporary directory
+            with tarfile.open(cached_model_file, "r") as tar:
+                tar.extractall(path=local_path)
+
+            # Check if the checkpoint is valid
+            Module._check_checkpoint(local_path)
+
+            # Load model arguments and instantiate the model
+            with open(local_path.joinpath("args.json")) as f:
+                args = json.load(f)
+
+            args["__args__"]["meshgraph_path"] = cached_icospheres
+            args["__args__"]["static_dataset_path"] = cached_static
+            model = Module.instantiate(args)
+
+            # Load the model weights
+            model_dict = torch.load(
+                local_path.joinpath("model.pt"), map_location=model.device
+            )
+            model.load_state_dict(model_dict)
+
         model.eval()
 
         # Load center and std normalizations
@@ -215,14 +230,23 @@ class ModulusGraphcast(torch.nn.Module, AutoModelMixin, PrognosticMixin):
         output_coords["time"] = coords["time"]
         output_coords["lead_time"] = output_coords["lead_time"] + coords["lead_time"]
 
-        # Load unpredicted variables
-        x, coords = self._load_unpredicted_variables(x, coords)
-
         x = x.squeeze(1)
         x = (x - self.center) / self.scale
         for (i, t) in enumerate(coords["time"]):
-            t = timearray_to_datetime(t + coords["lead_time"])
-            x[i : i + 1] = self.model(x[i : i + 1], t)
+            t = timearray_to_datetime(t + coords["lead_time"])[0]
+            # Add cosine zenith angle
+            cosz = cos_zenith_angle(t, self.LON, self.LAT)
+            cosz = cosz.astype(np.float32)
+            z = (
+                torch.as_tensor(cosz, device=x.device, dtype=torch.float32)
+                .unsqueeze(0)
+                .unsqueeze(0)
+            )
+            z = torch.cat((x[i : i + 1], z), dim=1)
+
+            # Model forward pass
+            x[i : i + 1] = self.model(z)
+
         x = self.scale * x + self.center
         x = x.unsqueeze(1)
         return x, output_coords
