@@ -47,3 +47,39 @@ def _broadcast_weights(
             )
         rs = [slice(len(v)) if c in rd else None for c, v in coords.items()]
         return weights[rs]
+
+
+def haversine_torch(
+    lat1: torch.Tensor, lon1: torch.Tensor, lat2: torch.Tensor, lon2: torch.Tensor
+) -> torch.Tensor:
+    """Utility function for computing the haversine distance between points.
+
+    Parameters
+    ----------
+    lat1: torch.Tensor
+        Latitudes for point 1
+    lon1: torch.Tensor
+        Longitudes for point 1
+    lat2: torch.Tensor
+        Latitudes for point 2
+    lon2: torch.Tensor
+        Longitudes for point 2
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor of haversine distances
+    """
+    lat1, lon1, lat2, lon2 = map(torch.deg2rad, [lat1, lon1, lat2, lon2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    return (
+        2
+        * 6371
+        * torch.arcsin(
+            torch.sqrt(
+                torch.sin(dlat / 2) ** 2
+                + torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2) ** 2
+            )
+        )
+    )
