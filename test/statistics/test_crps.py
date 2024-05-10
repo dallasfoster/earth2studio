@@ -22,7 +22,7 @@ import pytest
 import torch
 
 from earth2studio.statistics import crps
-from earth2studio.statistics.crps import crps_from_empirical_cdf
+from earth2studio.statistics.crps import _crps_from_empirical_cdf
 
 
 @pytest.mark.parametrize(
@@ -121,7 +121,7 @@ def test_crps_accuracy(device: str, rtol: float = 1e-2, atol: float = 1e-2) -> N
     y = 3.0 + torch.zeros((1,), device=device, dtype=torch.float32)
 
     # Test pure crps
-    c = crps_from_empirical_cdf(x, y, dim=0)
+    c = _crps_from_empirical_cdf(x, y, dim=0)
     true_crps = (np.sqrt(2) - 1.0) / np.sqrt(np.pi)
     assert torch.allclose(
         c,
@@ -133,7 +133,7 @@ def test_crps_accuracy(device: str, rtol: float = 1e-2, atol: float = 1e-2) -> N
     x = 3.0 + torch.randn((1, 10_000), device=device, dtype=torch.float32)
 
     # Test pure crps
-    c = crps_from_empirical_cdf(x, y, dim=1)
+    c = _crps_from_empirical_cdf(x, y, dim=1)
     true_crps = (np.sqrt(2) - 1.0) / np.sqrt(np.pi)
     assert torch.allclose(
         c,

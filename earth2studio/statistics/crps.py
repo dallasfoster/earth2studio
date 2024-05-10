@@ -22,11 +22,20 @@ from earth2studio.utils.type import CoordSystem
 
 class crps:
     """
+    Compute the Continuous Ranked Probably Score (CRPS).
 
+    Uses this formula
+        # int [F(x) - 1(x-y)]^2 dx
+
+    where F is the emperical CDF and 1(x-y) = 1 if x > y.
+
+
+    This statistic reduces over a single dimension, where the presumed ensemble dimension
+    does not appear in the truth/observation tensor.
 
     Parameters
     ----------
-    reduction_dimensions: str
+    reduction_dimension: str
         A name corresponding to a dimension to perform the
         statistical reduction over. Example: 'ensemble'
     """
@@ -90,7 +99,7 @@ class crps:
                 "x and y must have broadcastable shapes but got"
                 + f"{x.shape} and {y.shape}"
             )
-
+        # Input coordinate checking
         coord_count = 0
         for c in x_coords:
             if c != self.reduction_dimension:
@@ -100,22 +109,25 @@ class crps:
 
         dim = list(x_coords).index(self.reduction_dimension)
 
-        _crps = crps_from_empirical_cdf(x, y, dim=dim)
+        _crps = _crps_from_empirical_cdf(x, y, dim=dim)
         return _crps, y_coords.copy()
 
 
-def crps_from_empirical_cdf(
+def _crps_from_empirical_cdf(
     ensemble: torch.Tensor, truth: torch.Tensor, dim: int = 0
 ) -> torch.Tensor:
-    """Compute the exact CRPS using the CDF method
+    """
+
+    Warning
+    -------
+    This method is being upstreamed to https://github.com/NVIDIA/modulus in the next release.
+
+    Compute the exact CRPS using the CDF method
 
     Uses this formula
         # int [F(x) - 1(x-y)]^2 dx
 
     where F is the emperical CDF and 1(x-y) = 1 if x > y.
-
-    This method is more memory efficient than the kernel method, and uses O(n
-    log n) compute instead of O(n^2), where n is the number of ensemble members.
 
     Parameters
     ----------

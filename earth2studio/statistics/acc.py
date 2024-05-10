@@ -19,37 +19,36 @@ import torch
 from earth2studio.data import DataSource
 from earth2studio.data.utils import fetch_data
 from earth2studio.statistics.utils import _broadcast_weights
+from earth2studio.utils.coords import handshake_coords, handshake_dim
 from earth2studio.utils.type import CoordSystem
 
 
 class acc:
     """
-    Statistic for calculating the root mean squared error of two tensors
-    over a set of given dimensions.
+    Statistic for calculating the anomaly correlation coefficient of two tensors
+    over a set of given dimensions, with respect to some optional climatology.
 
     Parameters
     ----------
     reduction_dimensions: List[str]
         A list of names corresponding to dimensions to perform the
         statistical reduction over. Example: ['lat', 'lon']
+    climatology: DataSource
+        Optional (by default None) climatology to remove from tensors to create
+        anomalies before computing the correlation coefficient.
     weights: torch.Tensor = None
         A tensor containing weights to assign to the reduction dimensions.
         Note that these weights must have the same number of dimensions
         as passed in reduction_dimensions.
         Example: if reduction_dimensions = ['lat', 'lon'] then
         assert weights.ndim == 2.
-    batch_update: bool = False
-        Whether to applying batch updates to the rmse with each invocation of __call__.
-        This is particularly useful when data is recieved in a stream of batches. Each
-        invocation of __call__ will return the running rmse. It particular, it will apply
-        the square root operation after calculating the running mean squared error.
     """
 
     def __init__(
         self,
         reduction_dimensions: list[str],
-        climatology: DataSource = None,
-        weights: torch.Tensor = None,
+        climatology: DataSource | None = None,
+        weights: torch.Tensor | None = None,
     ):
 
         if weights is not None:
@@ -83,17 +82,34 @@ class acc:
         x_coords : CoordSystem
             Ordered dict representing coordinate system that describes the `x` tensor.
             'reduction_dims' must be in coords.
+            "time" and "variable" must be in x_coords.
         y : torch.Tensor
-            Input tensor #2 intended to apply statistic to.
+            Input tensor #2 intended to be used as validation data.
         y_coords : CoordSystem
             Ordered dict representing coordinate system that describes the `y` tensor.
             'reduction_dims' must be in coords.
+            "time" and "variable" must be in y_coords.
+            If "lead_time" is in x_coords, then "lead_time" must also be in y_coords. The
+            intention, in this case, is that users will use `fetch_data` to make it easier
+            to match validation times.
 
         Returns
         -------
         tuple[torch.Tensor, CoordSystem]
             Returns anomaly correlation coefficient tensor with appropriate reduced coordinates.
+
+        Note
+        ----
+        Reference: https://www.atmos.albany.edu/daes/atmclasses/atm401/spring_2016/ppts_pdfs/ECMWF_ACC_definition.pdf
         """
+
+        # Input coordinate checking
+        handshake_dim(x_coords, "time")
+        handshake_dim(x_coords, "variable")
+        for i, c in enumerate(x_coords):
+            handshake_dim(y_coords, c, i)
+            handshake_coords(x_coords, y_coords, c)
+
         dims = [list(x_coords).index(rd) for rd in self.reduction_dimensions]
         output_coords = CoordSystem(
             {
