@@ -17,7 +17,7 @@ import os
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from math import ceil
-from typing import Any
+from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -29,7 +29,7 @@ from earth2studio.data import DataSource, fetch_data
 from earth2studio.io import ZarrBackend
 from earth2studio.models.px import PrognosticModel
 from earth2studio.statistics import Metric
-from earth2studio.utils.coords import map_coords, split_coords
+from earth2studio.utils.coords import CoordSystem, map_coords, split_coords
 from earth2studio.utils.time import to_time_array
 
 # %%
@@ -55,8 +55,10 @@ def run(
     times: list[str] | list[datetime] | list[np.datetime64],
     nsteps: int,
     prognostic: PrognosticModel,
-    data: DataSource,
-    metrics: list[Metric],
+    initial_condition_data: DataSource,
+    validation_data: DataSource,
+    metrics: Dict[str, Metric],
+    output_coords: CoordSystem = OrderedDict({}),
     output_directory: str = os.path.join(os.curdir, "outputs"),
     time_batch_size: int = None,
     io_kwargs: dict[str, Any] = {},
@@ -99,7 +101,7 @@ def run(
 
     # Set up IO backend (create backend to hold data in memory.)
     local_times = to_time_array(times)
-    local_times = np.array_split(times, world_size)[rank]
+    local_times = np.array_split(local_times, world_size)[rank]
     total_coords = OrderedDict(
         {
             "time": local_times,
@@ -116,11 +118,14 @@ def run(
         if coord not in ["batch", "time", "lead_time"]:
             total_coords[coord] = prognostic.output_coords[coord]
 
+    for key, value in total_coords.items():
+        total_coords[key] = output_coords.get(key, value)
+
     variables_to_save = total_coords.pop("variable")
 
-    # Set up validation backend
+    # Set up validation backends
     ios = {}
-    for metric in metrics:
+    for name, metric in metrics.items():
         val_coords = OrderedDict(
             {
                 k: total_coords[k]
@@ -131,10 +136,10 @@ def run(
         kwargs = io_kwargs.get(str(metric), {})
         kwargs["file_name"] = os.path.join(
             output_directory,
-            f"rank_{rank}_" + kwargs.get("file_name", str(metric) + ".zarr"),
+            f"rank_{rank}_" + kwargs.get("file_name", name + ".zarr"),
         )
-        ios[str(metric)] = ZarrBackend(**kwargs)
-        ios[str(metric)].add_array(val_coords, variables_to_save)
+        ios[name] = ZarrBackend(**kwargs)
+        ios[name].add_array(val_coords, variables_to_save)
 
     # Calculate batches
 
@@ -179,14 +184,15 @@ def run(
                     variable=coords["variable"],
                     device=device,
                 )
-                for metric in metrics:
+                for name, metric in metrics.items():
                     out, out_coords = metric(x, coords, y, y_coords)
-                    ios[str(metric)].write(*split_coords(out, out_coords))
+                    out, out_coords = map_coords(out, out_coords, output_coords)
+                    ios[name].write(*split_coords(out, out_coords))
                 pbar.update(1)
                 if step == nsteps:
                     break
 
-    logger.success("Rank {rank}: Inference complete")
+    logger.success(f"Rank {rank}: Inference complete")
     return ios
 
 
@@ -201,24 +207,24 @@ from dotenv import load_dotenv
 load_dotenv()  # TODO: make common example prep function
 
 from earth2studio.data import DataSetFile
-from earth2studio.models.px import Pangu6
+from earth2studio.models.px import SFNO
 from earth2studio.statistics import lat_weight, rmse
 
 # Load the default model package which downloads the check point from NGC
-model = Pangu6.load_model(Pangu6.load_default_package())
+model = SFNO.load_model(SFNO.load_default_package())
 
 # Create the data source
-ds = DataSetFile(os.environ["dataset_path"])
+ds = DataSetFile(os.environ["dataset_path"], "fields")
 
 # Construct the metric
-metrics = [
-    rmse(
+metrics = {
+    'rmse_lat_lon': rmse(
         reduction_dimensions=["lat", "lon"],
         weights=torch.as_tensor(lat_weight(model.input_coords["lat"]), device="cuda:0")
         .unsqueeze(1)
         .repeat(1, 1440),
     ),
-    rmse(reduction_dimensions=["time"], batch_update=True),
+    'rmse_map': rmse(reduction_dimensions=["time"], batch_update=True),
 ]
 
 # Construct the kwargs for passing to the metric IOBackend (zarr)
@@ -232,7 +238,9 @@ io_kwargs = {
         "chunks": {"lead_time": 1},
     },
 }
-output_directory = f"outputs/scoring/{str(model)}/"
+output_directory = os.path.join(
+    os.environ.get("output_data_path", "./output/scoring"), str(model)
+)
 
 # %%
 # Execute the Workflow
@@ -242,14 +250,14 @@ output_directory = f"outputs/scoring/{str(model)}/"
 # then post process. Some have additional APIs that can be handy for post-processing or
 # saving to file. Check the API docs for more information.
 #
-# For the validation forecast we will predict for 15 days and 169 time stamps covering
-# the years 2019 and 2020. (these will get executed as a batch)
+# For the validation forecast we will predict for 15 days and 1400 time stamps covering
+# the year 2018. (these will get executed as a batch)
 # %%
 
 # Construct the Times over which to perform inference
 
-times = [datetime(2018, 1, 1) + timedelta(hours=6) * i for i in range(1460)]
-time_batch_size = 4
+times = [datetime(2018, 1, 1) + timedelta(hours=6) * i for i in range(1400)]
+time_batch_size = 16
 
 # Length of simulation
 nsteps = 60
@@ -260,21 +268,9 @@ io = run(
     model,
     ds,
     metrics,
+    output_coords={"variable": np.array(["t2m", "tcwv", "z500", "t850"])},
     output_directory=output_directory,
     io_kwargs=io_kwargs,
     time_batch_size=time_batch_size,
 )
 
-# %%
-# Post Processing
-# ---------------
-# The last step is to post process our results. Cartopy is a great library for plotting
-# fields on projections of a sphere. Here we will just plot the temperature at 2 meters
-# (t2m) 1 day into the forecast.
-#
-# Notice that the Zarr IO function has additional APIs to interact with the stored data.
-
-# %%
-
-# import cartopy.crs as ccrs
-# import matplotlib.pyplot as plt

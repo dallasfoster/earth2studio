@@ -40,7 +40,7 @@ class KVBackend:
         self.root: dict[str, torch.Tensor] = {}
         self.coords: CoordSystem = OrderedDict({})
         self.dims: dict[str, list[str]] = {}
-
+        
     def __contains__(self, item: str) -> bool:
         """Checks if item in KV store.
 
