@@ -160,7 +160,7 @@ def run(
         time = local_times[time_index : time_index + time_batch_size]
         # Fetch data from data source and load onto device
         x, coords = fetch_data(
-            source=data,
+            source=initial_condition_data,
             time=time,
             lead_time=prognostic.input_coords["lead_time"],
             variable=prognostic.input_coords["variable"],
@@ -179,7 +179,7 @@ def run(
             for step, (x, coords) in enumerate(model):
                 # Compute Metrics
                 y, y_coords = fetch_data(
-                    source=data,
+                    source=validation_data,
                     time=coords["time"] + coords["lead_time"],
                     variable=coords["variable"],
                     device=device,
@@ -214,7 +214,8 @@ from earth2studio.statistics import lat_weight, rmse
 model = SFNO.load_model(SFNO.load_default_package())
 
 # Create the data source
-ds = DataSetFile(os.environ["dataset_path"], "fields")
+initial_data = DataSetFile(os.environ["dataset_path"], "fields")
+val_data = DataSetFile(os.environ["dataset_path"], "fields")
 
 # Construct the metric
 metrics = {
@@ -225,21 +226,21 @@ metrics = {
         .repeat(1, 1440),
     ),
     'rmse_map': rmse(reduction_dimensions=["time"], batch_update=True),
-]
+}
 
 # Construct the kwargs for passing to the metric IOBackend (zarr)
 io_kwargs = {
-    str(metrics[0]): {
+    list(metrics)[0]: {
         "file_name": "lat_lon_rmse.zarr",
         "chunks": {"time": 1, "lead_time": 1},
     },
-    str(metrics[1]): {
+    list(metrics)[1]: {
         "file_name": "rmse_map.zarr",
         "chunks": {"lead_time": 1},
     },
 }
 output_directory = os.path.join(
-    os.environ.get("output_data_path", "./output/scoring"), str(model)
+    os.environ.get("output_data_path", "./output/scoring"), "sfno_73ch_small"
 )
 
 # %%
@@ -266,7 +267,8 @@ io = run(
     times,
     nsteps,
     model,
-    ds,
+    initial_data,
+    val_data,
     metrics,
     output_coords={"variable": np.array(["t2m", "tcwv", "z500", "t850"])},
     output_directory=output_directory,
