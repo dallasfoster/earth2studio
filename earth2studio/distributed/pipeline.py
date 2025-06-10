@@ -23,6 +23,7 @@ from queue import Empty, Queue
 import numpy as np
 import torch
 from loguru import logger
+from nvtx import annotate
 
 from earth2studio.distributed.config import (
     DiagnosticConfig,
@@ -30,7 +31,7 @@ from earth2studio.distributed.config import (
     PipelineConfig,
     PrognosticConfig,
 )
-from earth2studio.utils.coords import CoordSystem, split_coords
+from earth2studio.utils.coords import CoordSystem, map_coords, split_coords
 
 # Configure loguru format to include thread name
 logger.remove()
@@ -55,11 +56,9 @@ def calculate_queue_size(
     """Calculate safe queue size based on available GPU memory and tensor size."""
     if device.type != "cuda":
         return 2  # Default size for CPU
-
     total_memory = torch.cuda.get_device_properties(device).total_memory
     available_memory = total_memory * memory_fraction
     tensor_memory = estimate_tensor_memory(sample_tensor)
-
     # Calculate how many tensors we can safely store
     # Use 20% of available memory for queues, rest for model
     queue_memory = available_memory * 0.2
@@ -133,6 +132,7 @@ class PipelineStage:
                     f"Error in stage {self.name}: {error}\n{self.error_traceback}"
                 )
                 self.stop_event.set()  # Signal all stages to stop on error
+                self._mark_complete()
 
     def _check_error(self) -> None:
         """Check and raise any stored error."""
@@ -178,8 +178,8 @@ class PrognosticStage(PipelineStage):
         super().__init__(config.name, config.device)
         self.model = config.model.to(self.device)
         self.stream = config.stream
-        self.memory_fraction = config.memory_fraction
         self.iterator = None
+        self.output_queue_size = config.output_queue_size
         logger.info(
             f"Initialized prognostic model {self.model.__class__.__name__} for stage {self.name}"
         )
@@ -200,31 +200,36 @@ class PrognosticStage(PipelineStage):
         try:
             start_time = time.time()
             logger.debug(f"Starting step for prognostic stage {self.name}")
-
-            # Use CUDA stream if available
-            if self.stream is not None:
-                with torch.cuda.stream(self.stream):
+            with annotate(f"prognostic_step_{self.name}"):
+                # Use CUDA stream if available
+                if self.stream is not None:
+                    with torch.cuda.stream(self.stream):
+                        logger.debug(
+                            f"Using CUDA stream {self.stream} for prognostic stage {self.name}"
+                        )
+                        try:
+                            x, coords = next(self.iterator)
+                            if self.device.type == "cuda":
+                                self.stream.synchronize()
+                        except StopIteration:
+                            self._signal_completion()
+                            return False
+                else:
                     try:
                         x, coords = next(self.iterator)
-                        if self.device.type == "cuda":
-                            self.stream.synchronize()
+                        torch.cuda.synchronize()
                     except StopIteration:
                         self._signal_completion()
                         return False
-            else:
-                try:
-                    x, coords = next(self.iterator)
-                except StopIteration:
-                    self._signal_completion()
-                    return False
 
-            processing_time = time.time() - start_time
-            memory_usage = self.get_memory_usage()
+                processing_time = time.time() - start_time
+                memory_usage = self.get_memory_usage()
 
-            # Send output to all downstream stages
-            for stage_name, queue in self.output_queues.items():
-                logger.debug(f"Stage {self.name} sending output to {stage_name}")
-                queue.put((x.clone(), coords.copy()))
+            with annotate(f"prognostic_sending_output_{self.name}"):
+                # Send output to all downstream stages
+                for stage_name, queue in self.output_queues.items():
+                    logger.debug(f"Stage {self.name} sending output to {stage_name}")
+                    queue.put((x.clone(), coords.copy()))
 
             # Record metrics
             self.metrics.add_metric(
@@ -257,60 +262,77 @@ class DiagnosticStage(PipelineStage):
         super().__init__(config.name, config.device)
         self.model = config.model.to(self.device)
         self.stream = config.stream
-        self.memory_fraction = config.memory_fraction
+        self.output_queue_size = config.output_queue_size
         logger.info(
             f"Initialized diagnostic model {self.model.__class__.__name__} for stage {self.name}"
         )
 
     def run(self) -> None:
         """Main processing loop for the diagnostic stage."""
+        internal_queue: Queue = Queue()
         try:
             while not self.stop_event.is_set():
-                queue_start = time.time()
-                logger.debug(f"Diagnostic stage {self.name} waiting for input")
+                with annotate(f"diagnostic_waiting_for_input_{self.name}"):
+                    queue_start = time.time()
+                    logger.debug(f"Diagnostic stage {self.name} waiting for input")
 
-                # Get input data
-                data = next((queue.get() for queue in self.input_queues.values()), None)
+                    # Get input data
+                    data = None
+                    while internal_queue.empty():
+                        for queue in self.input_queues.values():
+                            if not queue.empty():
+                                internal_queue.put(queue.get())
+
+                    data = internal_queue.get()
 
                 if data is None:
-                    # Propagate termination signal and mark complete
-                    logger.info(
-                        f"Diagnostic stage {self.name} received completion signal"
-                    )
-                    for stage_name, queue in self.output_queues.items():
-                        logger.debug(
-                            f"Sending completion signal from {self.name} to {stage_name}"
+                    with annotate(f"diagnostic_termination_signal_{self.name}"):
+                        # Propagate termination signal and mark complete
+                        logger.info(
+                            f"Diagnostic stage {self.name} received completion signal"
                         )
-                        queue.put(None)
-                    for queue in self.input_queues.values():
-                        queue.task_done()
-                    break
+                        for stage_name, queue in self.output_queues.items():
+                            logger.debug(
+                                f"Sending completion signal from {self.name} to {stage_name}"
+                            )
+                            queue.put(None)
+                        for queue in self.input_queues.values():
+                            queue.task_done()
+                        break
 
-                queue_wait = time.time() - queue_start
-                start_time = time.time()
+                with annotate(f"diagnostic_processing_{self.name}"):
+                    queue_wait = time.time() - queue_start
+                    start_time = time.time()
 
-                x, coords = data
-                x = x.to(self.device)
-                logger.debug(
-                    f"Stage {self.name} processing input tensor of shape {x.shape}"
-                )
-
-                # Process data using CUDA stream if available
-                if self.stream is not None:
-                    with torch.cuda.stream(self.stream):
+                    x, coords = data
+                    x = x.to(self.device)
+                    logger.debug(
+                        f"Stage {self.name} processing input tensor of shape {x.shape}"
+                    )
+                    x, coords = map_coords(x, coords, self.model.input_coords())
+                    # Process data using CUDA stream if available
+                    if self.stream is not None:
+                        with torch.cuda.stream(self.stream):
+                            logger.debug(
+                                f"Using CUDA stream {self.stream} for diagnostic stage {self.name}"
+                            )
+                            output, out_coords = self.model(x, coords)
+                            if self.device.type == "cuda":
+                                self.stream.synchronize()
+                    else:
                         output, out_coords = self.model(x, coords)
-                        if self.device.type == "cuda":
-                            self.stream.synchronize()
-                else:
-                    output, out_coords = self.model(x, coords)
+                        torch.cuda.synchronize()
 
                 processing_time = time.time() - start_time
                 memory_usage = self.get_memory_usage()
 
                 # Send output to downstream stages
-                for stage_name, queue in self.output_queues.items():
-                    logger.debug(f"Stage {self.name} sending output to {stage_name}")
-                    queue.put((output.clone(), out_coords.copy()))
+                with annotate(f"diagnostic_sending_output_{self.name}"):
+                    for stage_name, queue in self.output_queues.items():
+                        logger.debug(
+                            f"Stage {self.name} sending output to {stage_name}"
+                        )
+                        queue.put((output.clone(), out_coords.copy()))
 
                 # Record metrics
                 self.metrics.add_metric(
@@ -338,47 +360,59 @@ class IOStage(PipelineStage):
         self.backend = config.backend
         self.array_name = config.array_name
         self.split_variable_key = config.split_variable_key
-        self.memory_fraction = config.memory_fraction
+        self.output_coords = config.output_coords
         logger.info(
             f"Initialized IO stage {self.name} with backend {self.backend.__class__.__name__}"
         )
+        self._is_initialized = config._is_initialized
 
     def run(self) -> None:
         """Main processing loop for the IO stage."""
+        internal_queue: Queue = Queue()
         try:
             while not self.stop_event.is_set():
-                queue_start = time.time()
-                logger.debug(f"IO stage {self.name} waiting for input")
+                with annotate(f"io_waiting_for_input_{self.name}"):
+                    queue_start = time.time()
+                    logger.debug(f"IO stage {self.name} waiting for input")
 
-                # Get input data
-                data = next((queue.get() for queue in self.input_queues.values()), None)
+                    # Get input data
+                    data = None
+                    while internal_queue.empty():
+                        for queue in self.input_queues.values():
+                            if not queue.empty():
+                                internal_queue.put(queue.get())
+
+                    data = internal_queue.get()
 
                 if data is None:
-                    logger.info(f"IO stage {self.name} received completion signal")
-                    for queue in self.input_queues.values():
-                        queue.task_done()
-                    break
+                    with annotate(f"io_terminiation_signal_{self.name}"):
+                        logger.info(f"IO stage {self.name} received completion signal")
+                        for queue in self.input_queues.values():
+                            queue.task_done()
+                        break
 
-                queue_wait = time.time() - queue_start
-                start_time = time.time()
+                with annotate(f"io_processing_{self.name}"):
+                    queue_wait = time.time() - queue_start
+                    start_time = time.time()
 
-                x, coords = data
-                x = x.detach().cpu()
-                logger.debug(f"Stage {self.name} writing tensor of shape {x.shape}")
+                    x, coords = data
+                    x = x.to(self.device)
+                    x, coords = map_coords(x, coords, self.output_coords)
+                    logger.debug(f"Stage {self.name} writing tensor of shape {x.shape}")
 
-                # Split variables if needed
-                if self.array_name is not None:
-                    array_name = self.array_name
-                else:
-                    x, coords, array_name = split_coords(
-                        x, coords, self.split_variable_key
-                    )
+                    # Split variables if needed
+                    if self.array_name is not None:
+                        array_name = self.array_name
+                    else:
+                        x, coords, array_name = split_coords(
+                            x, coords, self.split_variable_key
+                        )
 
-                self.backend.write(x, coords, array_name)
-                logger.debug(f"Stage {self.name} wrote data to arrays {array_name}")
+                    self.backend.write(x, coords, array_name)
+                    logger.debug(f"Stage {self.name} wrote data to arrays {array_name}")
 
-                processing_time = time.time() - start_time
-                memory_usage = self.get_memory_usage()
+                    processing_time = time.time() - start_time
+                    memory_usage = self.get_memory_usage()
 
                 # Record metrics
                 self.metrics.add_metric(
@@ -435,19 +469,15 @@ class Pipeline:
         for prog_stage in self.config.prognostic_stages:
             for output_name in prog_stage.output_stages:
                 if output_name in self.diagnostic_stages:
-                    target_stage = self.diagnostic_stages[output_name]
-                    queue_size = calculate_queue_size(
-                        target_stage.memory_fraction, target_stage.device, sample_tensor
-                    )
+                    queue: Queue = Queue(maxsize=prog_stage.output_queue_size)
                 else:
-                    queue_size = 2  # Fixed size for IO stages
+                    queue = Queue()
 
-                queue: Queue = Queue(maxsize=queue_size)
                 self.prognostic_stages[prog_stage.name].output_queues[
                     output_name
                 ] = queue
                 logger.debug(
-                    f"Connected {prog_stage.name} -> {output_name} with queue size {queue_size}"
+                    f"Connected {prog_stage.name} -> {output_name} with queue size {queue.maxsize}"
                 )
 
                 if output_name in self.diagnostic_stages:
@@ -461,19 +491,15 @@ class Pipeline:
         for diag_stage in self.config.diagnostic_stages:
             for output_name in diag_stage.output_stages:
                 if output_name in self.diagnostic_stages:
-                    target_stage = self.diagnostic_stages[output_name]
-                    queue_size = calculate_queue_size(
-                        target_stage.memory_fraction, target_stage.device, sample_tensor
-                    )
+                    queue = Queue(maxsize=diag_stage.output_queue_size)
                 else:
-                    queue_size = 2  # Fixed size for IO stages
+                    queue = Queue()
 
-                queue = Queue(maxsize=queue_size)
                 self.diagnostic_stages[diag_stage.name].output_queues[
                     output_name
                 ] = queue
                 logger.debug(
-                    f"Connected {diag_stage.name} -> {output_name} with queue size {queue_size}"
+                    f"Connected {diag_stage.name} -> {output_name} with queue size {queue.maxsize}"
                 )
 
                 if output_name in self.diagnostic_stages:
@@ -482,6 +508,156 @@ class Pipeline:
                     ] = queue
                 elif output_name in self.io_stages:
                     self.io_stages[output_name].input_queues[diag_stage.name] = queue
+
+    def _determine_io_backend_coords(
+        self,
+        prognostic_stages: dict[str, PrognosticStage],
+        diagnostic_stages: dict[str, DiagnosticStage],
+        io_stage: IOStage,
+        nsteps: int,
+        coords: CoordSystem,
+    ) -> list[CoordSystem]:
+        """Determine the coordinate system for the IO backend."""
+        logger.info("Determining IO backend coordinates")
+
+        def trace_pipeline_chain(
+            io_stage_name: str,
+        ) -> list[tuple[PrognosticStage | None, list[DiagnosticStage]]]:
+            """Trace back through the pipeline to find all chains that feed into an IO stage.
+
+            This function recursively explores all possible paths from the IO stage back to
+            prognostic stages, through any number of diagnostic stages.
+
+            Returns a list of tuples, where each tuple contains:
+            - The prognostic stage at the start of the chain (or None if not found)
+            - The list of diagnostic stages in order from prognostic to IO stage
+            """
+
+            def trace_recursive(
+                current_stage_name: str, current_chain: list[DiagnosticStage]
+            ) -> list[tuple[PrognosticStage | None, list[DiagnosticStage]]]:
+
+                chains: list[tuple[PrognosticStage | None, list[DiagnosticStage]]] = []
+
+                # First check if any prognostic stage outputs to current_stage
+                chains = [
+                    (prog, current_chain.copy())
+                    for prog in prognostic_stages.values()
+                    if current_stage_name in prog.output_queues
+                ]
+
+                # Then look through diagnostic stages for more possible paths
+                for diag in diagnostic_stages.values():
+                    if current_stage_name in diag.output_queues:
+                        # Create new chain with this diagnostic stage
+                        new_chain = current_chain.copy()
+                        new_chain.insert(0, diag)  # Insert at front to maintain order
+                        # Recursively trace from this diagnostic stage
+                        chains.extend(trace_recursive(diag.name, new_chain))
+
+                # If no chains found, return a chain with no prognostic source
+                if not chains and not current_chain:
+                    chains.append((None, []))
+
+                return chains
+
+            # Start the recursive trace from the IO stage
+            return trace_recursive(io_stage_name, [])
+
+        # Determine IO backend coordinates
+        chains = trace_pipeline_chain(io_stage.name)
+        if not chains:
+            logger.warning(
+                f"Could not find any valid chains for IO stage {io_stage.name}"
+            )
+            raise ValueError(
+                f"Could not find any valid chains for IO stage {io_stage.name}"
+            )
+
+        valid_chains = [chain for chain in chains if chain[0] is not None]
+        if not valid_chains:
+            logger.warning(
+                f"Could not find any chains with prognostic source for IO stage {io_stage.name}"
+            )
+            raise ValueError(
+                f"Could not find any chains with prognostic source for IO stage {io_stage.name}"
+            )
+
+        total_coords: list[CoordSystem] = []
+        for valid_chain in valid_chains:
+            prog_stage, diag_chain = valid_chain
+
+            if prog_stage is None:
+                continue
+
+            logger.debug(
+                f"Using chain for IO stage {io_stage.name}: {prog_stage.name} -> {' -> '.join(d.name for d in diag_chain)}"
+            )
+
+            # Start with input coordinates
+            prog_input_coords = coords.copy()
+
+            # Transform through prognostic model's output coordinates
+            current_coords = prog_stage.model.output_coords(prog_input_coords).copy()
+            logger.debug(f"Coordinates after prognostic stage: {current_coords}")
+
+            # Transform through each diagnostic model in the chain
+            for diag_stage in diag_chain:
+                # Map to diagnostic input coordinates first
+                current_size = [len(value) for value in current_coords.values()]
+                _, current_coords = map_coords(
+                    torch.randn(*current_size),
+                    current_coords,
+                    diag_stage.model.input_coords(),
+                )
+                # Then get diagnostic output coordinates
+                current_coords = diag_stage.model.output_coords(current_coords)
+                logger.debug(
+                    f"Coordinates after diagnostic stage {diag_stage.name}: {current_coords}"
+                )
+
+            # Remove batch dimensions
+            for key, value in list(current_coords.items()):
+                if value.shape == (0,) or key == "batch":
+                    del current_coords[key]
+
+            # Add lead time dimension
+            if "lead_time" in current_coords:
+                base_lead_time = current_coords["lead_time"]
+                current_coords["lead_time"] = np.asarray(
+                    [base_lead_time * i for i in range(nsteps + 1)]
+                ).flatten()
+
+            # Move time dimensions to front
+            if "lead_time" in current_coords:
+                current_coords.move_to_end("lead_time", last=False)
+            if "time" in current_coords:
+                current_coords.move_to_end("time", last=False)
+            if "ensemble" in current_coords:
+                current_coords.move_to_end("ensemble", last=False)
+
+            total_coords.append(current_coords)
+
+        return total_coords
+
+    def initialize_io_backend(
+        self, io_stage: IOStage, total_coords: CoordSystem
+    ) -> None:
+        """Initialize the IO backend for a single IO stage."""
+        logger.info(f"Initializing IO backend for {io_stage.name}")
+
+        # Get variable names and remove from coords
+        if io_stage.array_name is not None:
+            var_names = io_stage.array_name
+        else:
+            var_names = total_coords.pop(io_stage.split_variable_key)
+
+        logger.debug(f"Final coordinates for IO stage {io_stage.name}: {total_coords}")
+        logger.debug(f"Array names: {var_names}")
+
+        # Add arrays to IO backend
+        io_stage.backend.add_array(total_coords, var_names)
+        io_stage._is_initialized = True
 
     def _initialize_io_backend(
         self,
@@ -504,103 +680,20 @@ class Pipeline:
         """
         logger.info("Initializing IO backends")
 
-        time = coords.get("time", None)
-
-        def trace_pipeline_chain(
-            io_stage_name: str,
-        ) -> tuple[PrognosticStage | None, list[DiagnosticStage]]:
-            """Trace back through the pipeline to find the chain of stages that feed into an IO stage."""
-            chain: list[DiagnosticStage] = []
-            current_stage_name = io_stage_name
-            prog_stage = None
-
-            # Work backwards through diagnostic stages until we find the prognostic source
-            while current_stage_name:
-                print(current_stage_name)
-                # Check if any prognostic stage outputs to current_stage
-                for prog in prognostic_stages.values():
-                    if current_stage_name in prog.output_queues:
-                        prog_stage = prog
-                        return prog_stage, chain
-
-                # If not found in prognostic, look through diagnostic stages
-                found = False
-                for diag in diagnostic_stages.values():
-                    print(diag, diag.output_queues)
-                    if current_stage_name in diag.output_queues:
-                        chain.insert(0, diag)  # Insert at front to maintain order
-                        current_stage_name = diag.name
-                        found = True
-                        break
-
-                if not found:
-                    break
-
-            return prog_stage, chain
-
-        for io_stage in io_stages.values():
-            logger.debug(f"Initializing IO backend for stage {io_stage.name}")
-
-            # Find the chain of stages that feed into this IO stage
-            prog_stage, diag_chain = trace_pipeline_chain(io_stage.name)
-
-            if prog_stage is None:
-                logger.warning(
-                    f"Could not find prognostic stage for IO stage {io_stage.name}"
-                )
+        for io_stage in self.io_stages.values():
+            if io_stage._is_initialized:
                 continue
 
-            # Start with prognostic model's input coordinates
-            prog_input_coords = prog_stage.model.input_coords()
-
-            # Transform through prognostic model's output coordinates
-            current_coords = prog_stage.model.output_coords(prog_input_coords).copy()
-            logger.debug(f"Coordinates after prognostic stage: {current_coords}")
-
-            # Transform through each diagnostic model in the chain
-            for diag_stage in diag_chain:
-                # Map to diagnostic input coordinates first
-                # Then get diagnostic output coordinates
-                current_coords = diag_stage.model.output_coords(current_coords)
-                logger.debug(
-                    f"Coordinates after diagnostic stage {diag_stage.name}: {current_coords}"
-                )
-
-            # Remove batch dimensions
-            for key, value in list(current_coords.items()):
-                if value.shape == (0,) or key == "batch":
-                    del current_coords[key]
-
-            # Add time dimensions
-            if time is not None:
-                current_coords["time"] = time
-
-            # Add lead time dimension
-            if "lead_time" in current_coords:
-                base_lead_time = current_coords["lead_time"]
-                current_coords["lead_time"] = np.asarray(
-                    [base_lead_time * i for i in range(nsteps + 1)]
-                ).flatten()
-
-            # Move time dimensions to front
-            if "lead_time" in current_coords:
-                current_coords.move_to_end("lead_time", last=False)
-            if "time" in current_coords:
-                current_coords.move_to_end("time", last=False)
-
-            # Get variable names and remove from coords
-            if io_stage.array_name is not None:
-                var_names = io_stage.array_name
-            else:
-                var_names = current_coords.pop(io_stage.split_variable_key)
-
-            logger.debug(
-                f"Final coordinates for IO stage {io_stage.name}: {current_coords}"
+            total_coords = self._determine_io_backend_coords(
+                self.prognostic_stages,
+                self.diagnostic_stages,
+                io_stage,
+                nsteps,
+                coords,
             )
-            logger.debug(f"Array names: {var_names}")
-
-            # Add arrays to IO backend
-            io_stage.backend.add_array(current_coords, var_names)
+            if total_coords is not None:
+                for tc in total_coords:
+                    self.initialize_io_backend(io_stage, tc)
 
     def _wait_for_completion(self, timeout: float = 30.0) -> bool:
         """Wait for all stages to complete or timeout.
@@ -632,20 +725,24 @@ class Pipeline:
         logger.info(f"Starting pipeline execution for {nsteps} steps")
         try:
             # Set up queues based on input tensor size
-            self._setup_queues(x)
+            with annotate("pipeline_setup_queues"):
+                self._setup_queues(x)
 
             # Initialize IO backends
-            self._initialize_io_backend(
-                self.prognostic_stages,
-                self.diagnostic_stages,
-                self.io_stages,
-                nsteps,
-                coords,
-            )
+            with annotate("pipeline_initialize_io_backend"):
+                self._initialize_io_backend(
+                    self.prognostic_stages,
+                    self.diagnostic_stages,
+                    self.io_stages,
+                    nsteps,
+                    coords,
+                )
 
             # Initialize prognostic stages
-            for prog_stage in self.prognostic_stages.values():
-                prog_stage.initialize(x, coords)
+            with annotate("pipeline_initialize_prognostic_stages"):
+                for prog_stage in self.prognostic_stages.values():
+                    x_, coords_ = map_coords(x, coords, prog_stage.model.input_coords())
+                    prog_stage.initialize(x_, coords_)
 
             # Start diagnostic and IO stages
             futures = [  # noqa: F841
@@ -657,11 +754,12 @@ class Pipeline:
             ]
 
             # Run prognostic stages for requested steps
-            for step in range(nsteps + 1):  # +1 for initial condition
-                logger.info(f"Processing step {step}/{nsteps}")
-                for prog_stage in self.prognostic_stages.values():
-                    if not prog_stage.step():
-                        break
+            with annotate("pipeline_run_prognostic_stages"):
+                for step in range(nsteps + 1):  # +1 for initial condition
+                    logger.info(f"Processing step {step}/{nsteps}")
+                    for prog_stage in self.prognostic_stages.values():
+                        if not prog_stage.step():
+                            break
 
             for prog_stage in self.prognostic_stages.values():
                 prog_stage._signal_completion()
