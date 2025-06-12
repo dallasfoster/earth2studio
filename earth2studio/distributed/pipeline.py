@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# type: ignore # This is temporary until we have a proper type system
 import threading
 import time
 import traceback
@@ -31,6 +32,7 @@ from earth2studio.distributed.config import (
     PipelineConfig,
     PrognosticConfig,
 )
+from earth2studio.distributed.load_balancing import LoadBalancer, RoundRobinBalancer
 from earth2studio.utils.coords import CoordSystem, map_coords, split_coords
 
 # Configure loguru format to include thread name
@@ -108,18 +110,40 @@ class StageMetrics:
 class PipelineStage:
     """Base class for pipeline stages with enhanced monitoring and error handling."""
 
-    def __init__(self, name: str, device: torch.device) -> None:
+    def __init__(
+        self,
+        name: str,
+        device: list[torch.device],
+        load_balancing_strategy: LoadBalancer = RoundRobinBalancer,
+    ) -> None:
         self.name = name
-        self.device = device
+        if not isinstance(device, list):
+            device = [device]
+        self.device = [
+            torch.device(dev) if isinstance(dev, str) else dev for dev in device
+        ]
         self.input_queues: dict[str, Queue] = {}
         self.output_queues: dict[str, Queue] = {}
         self.metrics = StageMetrics()
         self.error: Exception | None = None
         self.error_lock = threading.Lock()
         self.stop_event = threading.Event()
-        self.completed = threading.Event()  # New flag to track completion
+        self.completed = threading.Event()
+        self._num_termination_signals = 0
+
+        # Load balancing setup
+        self.load_balancer = load_balancing_strategy(device)
+
+        # Queue for distributing work to device workers
+        self.work_queue: dict[int, Queue] = {
+            device_idx: Queue() for device_idx in range(len(device))
+        }
+
+        # Create worker threads for each device
+        self.workers: list[threading.Thread] = []
+
         logger.info(
-            f"Initialized {self.__class__.__name__} '{name}' on device {device}"
+            f"Initialized {self.__class__.__name__} '{name}' on devices {device}"
         )
 
     def _set_error(self, error: Exception) -> None:
@@ -131,7 +155,7 @@ class PipelineStage:
                 logger.error(
                     f"Error in stage {self.name}: {error}\n{self.error_traceback}"
                 )
-                self.stop_event.set()  # Signal all stages to stop on error
+                self.stop_event.set()
                 self._mark_complete()
 
     def _check_error(self) -> None:
@@ -161,75 +185,173 @@ class PipelineStage:
         self.completed.set()
         logger.debug(f"Stage {self.name} marked as complete")
 
-    def get_memory_usage(self) -> float:
-        """Get current GPU memory usage for this stage's device."""
-        if self.device.type == "cuda":
+    def get_memory_usage(self, device: torch.device) -> float:
+        """Get current GPU memory usage for the specified device."""
+        if device.type == "cuda":
             return (
-                torch.cuda.memory_allocated(self.device)
-                / torch.cuda.get_device_properties(self.device).total_memory
+                torch.cuda.memory_allocated(device)
+                / torch.cuda.get_device_properties(device).total_memory
             )
         return 0.0
+
+    def _process_on_device(
+        self, device_idx: int, data: tuple[torch.Tensor, CoordSystem]
+    ) -> None:
+        """Process data on a specific device. To be implemented by subclasses."""
+        raise NotImplementedError
+
+    def _device_worker(self, device_idx: int) -> None:
+        """Worker thread for processing data on a specific device."""
+        device = self.device[device_idx]
+        logger.debug(f"Starting worker thread for {self.name} on device {device}")
+
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    # Get work from the queue
+                    data = self.work_queue[device_idx].get()
+                    logger.info(
+                        f"Worker thread for {self.name} on device {self.device[device_idx]} got work"
+                    )
+                    if data is None:
+                        self._num_termination_signals += 1
+                        if self._num_termination_signals >= len(self.input_queues):
+                            logger.info(
+                                f"Worker thread for {self.name} on device {self.device[device_idx]} got termination signal"
+                            )
+                            break
+                        else:
+                            logger.info(
+                                f"Worker thread for {self.name} on device {self.device[device_idx]} got termination signal but not all input queues have recieved a termination signal: {self._num_termination_signals} of {len(self.input_queues)}"
+                            )
+                            self.work_queue[device_idx].task_done()
+                            continue
+
+                    logger.info(
+                        f"Worker thread for {self.name} on device {self.device[device_idx]} processing data"
+                    )
+                    self._process_on_device(device_idx, data)
+                    self.work_queue[device_idx].task_done()
+
+                except Empty:
+                    continue
+                except Exception as e:
+                    self._set_error(e)
+                    break
+        finally:
+            logger.debug(f"Worker thread for {self.name} on device {device} stopping")
+
+    def start_workers(self) -> None:
+        """Start worker threads for each device."""
+        for device_idx in range(len(self.device)):
+            worker = threading.Thread(
+                target=self._device_worker,
+                args=(device_idx,),
+                name=f"{self.name}_worker_{device_idx}",
+            )
+            worker.daemon = True
+            worker.start()
+            self.workers.append(worker)
+
+    def stop_workers(self) -> None:
+        """Stop all worker threads."""
+        # Signal workers to stop
+        for _ in range(len(self.workers)):
+            for device_idx in range(len(self.device)):
+                self.work_queue[device_idx].put(None)
+
+        # Wait for workers to finish
+        for worker in self.workers:
+            worker.join(timeout=1.0)
+
+        self.workers = []
 
 
 class PrognosticStage(PipelineStage):
     """Enhanced prognostic stage with monitoring and CUDA stream support."""
 
     def __init__(self, config: PrognosticConfig) -> None:
-        super().__init__(config.name, config.device)
-        self.model = config.model.to(self.device)
-        self.stream = config.stream
-        self.iterator = None
+        super().__init__(config.name, config.device, config.load_balancing)
+        # Create model instance for each device
+        self.models = [config.model.to(device) for device in self.device]
+        self.streams = config.streams
         self.output_queue_size = config.output_queue_size
         logger.info(
-            f"Initialized prognostic model {self.model.__class__.__name__} for stage {self.name}"
+            f"Initialized {len(self.models)} prognostic models for stage {self.name}"
         )
 
-    def initialize(self, x: torch.Tensor, coords: CoordSystem) -> None:
-        """Initialize the prognostic iterator."""
+        self.start_workers()
+
+    def _process_on_device(
+        self, device_idx: int, data: tuple[torch.Tensor, CoordSystem, int]
+    ) -> None:
+        """Process one step on the specified device."""
+        x, coords, nsteps = data
+
+        start_time = time.time()
         logger.debug(
-            f"Initializing prognostic stage {self.name} with input shape {x.shape}"
+            f"Starting step for prognostic stage {self.name} on device {self.device[device_idx]}"
         )
-        x = x.to(self.device)
-        self.iterator = self.model.create_iterator(x, coords)
-
-    def step(self) -> bool:
-        """Execute one step of the prognostic model."""
-        if self.iterator is None:
-            raise RuntimeError("Must initialize prognostic stage before stepping")
 
         try:
-            start_time = time.time()
-            logger.debug(f"Starting step for prognostic stage {self.name}")
-            with annotate(f"prognostic_step_{self.name}"):
-                # Use CUDA stream if available
-                if self.stream is not None:
-                    with torch.cuda.stream(self.stream):
-                        logger.debug(
-                            f"Using CUDA stream {self.stream} for prognostic stage {self.name}"
-                        )
-                        try:
-                            x, coords = next(self.iterator)
-                            if self.device.type == "cuda":
-                                self.stream.synchronize()
-                        except StopIteration:
-                            self._signal_completion()
-                            return False
-                else:
+            # Use CUDA stream if available
+            if self.streams[device_idx] is not None:
+                with torch.cuda.stream(self.streams[device_idx]):
+                    logger.debug(
+                        f"Using CUDA stream {self.streams[device_idx]} for prognostic stage {self.name}"
+                    )
+                    iterator = self.models[device_idx].create_iterator(x, coords)
                     try:
-                        x, coords = next(self.iterator)
-                        torch.cuda.synchronize()
+                        for step, (x, coords) in enumerate(iterator):
+                            if self.device[device_idx].type == "cuda":
+                                self.streams[device_idx].synchronize()
+
+                            # Send output to all downstream stages
+                            with annotate(f"prognostic_sending_output_{self.name}"):
+                                for stage_name, queue in self.output_queues.items():
+                                    logger.debug(
+                                        f"Stage {self.name} sending output step {step} to {stage_name}"
+                                    )
+                                    queue.put((x.clone(), coords.copy()))
+
+                            # Stop if we've reached the end of the time steps
+                            if step == nsteps:
+                                break
+
                     except StopIteration:
+                        logger.info(
+                            f"Prognostic stage {self.name} completed iteration in except StopIteration"
+                        )
                         self._signal_completion()
-                        return False
+                        return
+            else:
+                try:
+                    iterator = self.models[device_idx].create_iterator(x, coords)
+                    for step, (x, coords) in enumerate(iterator):
+                        if self.device[device_idx].type == "cuda":
+                            torch.cuda.synchronize(self.device[device_idx])
 
-                processing_time = time.time() - start_time
-                memory_usage = self.get_memory_usage()
+                        # Send output to all downstream stages
+                        with annotate(f"prognostic_sending_output_{self.name}"):
+                            for stage_name, queue in self.output_queues.items():
+                                logger.debug(
+                                    f"Stage {self.name} sending output step {step} to {stage_name}"
+                                )
+                                queue.put((x.clone(), coords.copy()))
 
-            with annotate(f"prognostic_sending_output_{self.name}"):
-                # Send output to all downstream stages
-                for stage_name, queue in self.output_queues.items():
-                    logger.debug(f"Stage {self.name} sending output to {stage_name}")
-                    queue.put((x.clone(), coords.copy()))
+                        # Stop if we've reached the end of the time steps
+                        if step == nsteps:
+                            break
+
+                except StopIteration:
+                    logger.info(
+                        f"Prognostic stage {self.name} completed iteration in except StopIteration"
+                    )
+                    self._signal_completion()
+                    return
+
+            processing_time = time.time() - start_time
+            memory_usage = self.get_memory_usage(self.device[device_idx])
 
             # Record metrics
             self.metrics.add_metric(
@@ -239,6 +361,21 @@ class PrognosticStage(PipelineStage):
                 batch_size=x.shape[0] if len(x.shape) > 3 else 1,
             )
 
+        except Exception as e:
+            self._set_error(e)
+            self._cleanup_queues()
+
+    def run(self, x: torch.Tensor, coords: CoordSystem, nsteps: int) -> bool:
+        """Execute one step of the prognostic model."""
+
+        try:
+            # Select device using load balancer
+            device_idx = self.load_balancer.select_device(
+                None
+            )  # No data needed for selection
+            self.work_queue[device_idx].put(
+                (x, coords, nsteps)
+            )  # Signal worker to process next step
             return True
 
         except Exception as e:
@@ -259,13 +396,72 @@ class DiagnosticStage(PipelineStage):
     """Enhanced diagnostic stage with monitoring and CUDA stream support."""
 
     def __init__(self, config: DiagnosticConfig) -> None:
-        super().__init__(config.name, config.device)
-        self.model = config.model.to(self.device)
-        self.stream = config.stream
+        super().__init__(config.name, config.device, config.load_balancing)
+        # Create model instance for each device
+        self.models = [config.model.to(device) for device in self.device]
+        self.streams = config.streams
         self.output_queue_size = config.output_queue_size
         logger.info(
-            f"Initialized diagnostic model {self.model.__class__.__name__} for stage {self.name}"
+            f"Initialized {len(self.models)} diagnostic models for stage {self.name}"
         )
+        # Start worker threads
+        self.start_workers()
+
+    def _process_on_device(
+        self, device_idx: int, data: tuple[torch.Tensor, CoordSystem]
+    ) -> None:
+        """Process data on the specified device."""
+        if data is None:
+            return
+
+        start_time = time.time()
+        x, coords = data
+        device = self.device[device_idx]
+        model = self.models[device_idx]
+        stream = self.streams[device_idx]
+        logger.info(
+            f"Processing data for {self.name} on device {device} with model {model}"
+        )
+        try:
+            # Move data to device
+            x = x.to(device)
+            logger.debug(
+                f"Stage {self.name} processing input tensor of shape {x.shape} on device {device}"
+            )
+
+            # Process data using CUDA stream if available
+            if stream is not None:
+                with torch.cuda.stream(stream):
+                    logger.debug(
+                        f"Using CUDA stream {stream} for diagnostic stage {self.name}"
+                    )
+                    output, out_coords = model(x, coords)
+                    if device.type == "cuda":
+                        stream.synchronize()
+            else:
+                output, out_coords = model(x, coords)
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+
+            processing_time = time.time() - start_time
+            memory_usage = self.get_memory_usage(device)
+            # Send output to downstream stages
+            with annotate(f"diagnostic_sending_output_{self.name}"):
+                for stage_name, queue in self.output_queues.items():
+                    logger.debug(f"Stage {self.name} sending output to {stage_name}")
+                    queue.put((output.clone(), out_coords.copy()))
+
+            # Record metrics
+            self.metrics.add_metric(
+                processing_time=processing_time,
+                queue_wait=0.0,
+                memory=memory_usage,
+                batch_size=x.shape[0] if len(x.shape) > 3 else 1,
+            )
+
+        except Exception as e:
+            self._set_error(e)
+            self._cleanup_queues()
 
     def run(self) -> None:
         """Main processing loop for the diagnostic stage."""
@@ -273,7 +469,6 @@ class DiagnosticStage(PipelineStage):
         try:
             while not self.stop_event.is_set():
                 with annotate(f"diagnostic_waiting_for_input_{self.name}"):
-                    queue_start = time.time()
                     logger.debug(f"Diagnostic stage {self.name} waiting for input")
 
                     # Get input data
@@ -285,65 +480,28 @@ class DiagnosticStage(PipelineStage):
 
                     data = internal_queue.get()
 
-                if data is None:
-                    with annotate(f"diagnostic_termination_signal_{self.name}"):
-                        # Propagate termination signal and mark complete
-                        logger.info(
-                            f"Diagnostic stage {self.name} received completion signal"
-                        )
-                        for stage_name, queue in self.output_queues.items():
-                            logger.debug(
-                                f"Sending completion signal from {self.name} to {stage_name}"
-                            )
-                            queue.put(None)
-                        for queue in self.input_queues.values():
-                            queue.task_done()
-                        break
+                    if data is not None:
+                        # Select device using load balancer
+                        device_idx = self.load_balancer.select_device(data)
 
-                with annotate(f"diagnostic_processing_{self.name}"):
-                    queue_wait = time.time() - queue_start
-                    start_time = time.time()
+                        # Add to work queue
+                        self.work_queue[device_idx].put(data)
+                        queue.task_done()
 
-                    x, coords = data
-                    x = x.to(self.device)
-                    logger.debug(
-                        f"Stage {self.name} processing input tensor of shape {x.shape}"
-                    )
-                    x, coords = map_coords(x, coords, self.model.input_coords())
-                    # Process data using CUDA stream if available
-                    if self.stream is not None:
-                        with torch.cuda.stream(self.stream):
-                            logger.debug(
-                                f"Using CUDA stream {self.stream} for diagnostic stage {self.name}"
-                            )
-                            output, out_coords = self.model(x, coords)
-                            if self.device.type == "cuda":
-                                self.stream.synchronize()
                     else:
-                        output, out_coords = self.model(x, coords)
-                        torch.cuda.synchronize()
-
-                processing_time = time.time() - start_time
-                memory_usage = self.get_memory_usage()
-
-                # Send output to downstream stages
-                with annotate(f"diagnostic_sending_output_{self.name}"):
-                    for stage_name, queue in self.output_queues.items():
-                        logger.debug(
-                            f"Stage {self.name} sending output to {stage_name}"
-                        )
-                        queue.put((output.clone(), out_coords.copy()))
-
-                # Record metrics
-                self.metrics.add_metric(
-                    processing_time=processing_time,
-                    queue_wait=queue_wait,
-                    memory=memory_usage,
-                    batch_size=x.shape[0] if len(x.shape) > 3 else 1,
-                )
-
-                for queue in self.input_queues.values():
-                    queue.task_done()
+                        with annotate(f"diagnostic_termination_signal_{self.name}"):
+                            logger.info(
+                                f"Diagnostic stage {self.name} received completion signal"
+                            )
+                            for queue in self.work_queue.values():
+                                queue.join()
+                            self.stop_workers()
+                            for stage_name, queue in self.output_queues.items():
+                                logger.debug(
+                                    f"Sending completion signal from {self.name} to {stage_name}"
+                                )
+                                queue.put(None)
+                            break
 
         except Exception as e:
             self._set_error(e)
@@ -356,7 +514,7 @@ class IOStage(PipelineStage):
     """Enhanced IO stage with monitoring."""
 
     def __init__(self, config: IOConfig) -> None:
-        super().__init__(config.name, config.device)
+        super().__init__(config.name, config.device, config.load_balancing)
         self.backend = config.backend
         self.array_name = config.array_name
         self.split_variable_key = config.split_variable_key
@@ -396,7 +554,7 @@ class IOStage(PipelineStage):
                     start_time = time.time()
 
                     x, coords = data
-                    x = x.to(self.device)
+                    x = x.to(self.device[0])
                     x, coords = map_coords(x, coords, self.output_coords)
                     logger.debug(f"Stage {self.name} writing tensor of shape {x.shape}")
 
@@ -407,12 +565,12 @@ class IOStage(PipelineStage):
                         x, coords, array_name = split_coords(
                             x, coords, self.split_variable_key
                         )
-
                     self.backend.write(x, coords, array_name)
+
                     logger.debug(f"Stage {self.name} wrote data to arrays {array_name}")
 
                     processing_time = time.time() - start_time
-                    memory_usage = self.get_memory_usage()
+                    memory_usage = self.get_memory_usage(self.device[0])
 
                 # Record metrics
                 self.metrics.add_metric(
@@ -448,6 +606,9 @@ class Pipeline:
         self._create_stages()
 
         self.executor = ThreadPoolExecutor()
+        self._is_initialized = False
+        self._is_running = False
+        self._diagnostic_futures = []
         logger.info("Pipeline initialization complete")
 
     def _create_stages(self) -> None:
@@ -462,7 +623,7 @@ class Pipeline:
         for io_stage in self.config.io_stages:
             self.io_stages[io_stage.name] = IOStage(io_stage)
 
-    def _setup_queues(self, sample_tensor: torch.Tensor) -> None:
+    def _setup_queues(self) -> None:
         """Set up queues with sizes based on memory constraints."""
         logger.info("Setting up pipeline queues")
         # Connect prognostic stages to their outputs
@@ -586,7 +747,7 @@ class Pipeline:
         total_coords: list[CoordSystem] = []
         for valid_chain in valid_chains:
             prog_stage, diag_chain = valid_chain
-
+            prog_model = prog_stage.models[0]
             if prog_stage is None:
                 continue
 
@@ -598,20 +759,21 @@ class Pipeline:
             prog_input_coords = coords.copy()
 
             # Transform through prognostic model's output coordinates
-            current_coords = prog_stage.model.output_coords(prog_input_coords).copy()
+            current_coords = prog_model.output_coords(prog_input_coords).copy()
             logger.debug(f"Coordinates after prognostic stage: {current_coords}")
 
             # Transform through each diagnostic model in the chain
             for diag_stage in diag_chain:
+                diag_model = diag_stage.models[0]
                 # Map to diagnostic input coordinates first
                 current_size = [len(value) for value in current_coords.values()]
                 _, current_coords = map_coords(
                     torch.randn(*current_size),
                     current_coords,
-                    diag_stage.model.input_coords(),
+                    diag_model.input_coords(),
                 )
                 # Then get diagnostic output coordinates
-                current_coords = diag_stage.model.output_coords(current_coords)
+                current_coords = diag_model.output_coords(current_coords)
                 logger.debug(
                     f"Coordinates after diagnostic stage {diag_stage.name}: {current_coords}"
                 )
@@ -720,72 +882,126 @@ class Pipeline:
 
         return False
 
+    def _initialize_pipeline(
+        self, x: torch.Tensor, coords: CoordSystem, nsteps: int
+    ) -> None:
+        """Initialize the pipeline if not already initialized."""
+        if self._is_initialized:
+            return
+
+        # Set up queues based on input tensor size
+        with annotate("pipeline_setup_queues"):
+            self._setup_queues()
+
+        # Initialize IO backends
+        with annotate("pipeline_initialize_io_backend"):
+            self._initialize_io_backend(
+                self.prognostic_stages,
+                self.diagnostic_stages,
+                self.io_stages,
+                nsteps,
+                coords,
+            )
+
+        # Start diagnostic and IO stages
+        self._diagnostic_futures = [
+            self.executor.submit(stage.run)
+            for stage in (
+                list(self.diagnostic_stages.values()) + list(self.io_stages.values())
+            )
+        ]
+
+        self._is_initialized = True
+        self._is_running = True
+
     def __call__(self, x: torch.Tensor, coords: CoordSystem, nsteps: int) -> None:
-        """Run the pipeline for nsteps iterations."""
-        logger.info(f"Starting pipeline execution for {nsteps} steps")
+        """Add input to the pipeline for processing.
+
+        This method is non-blocking and will return immediately after queueing the input.
+        Use join() to wait for all processing to complete.
+        """
+        # Would be nice to move nsteps to the constructor
+        #  and have it be a list of nsteps for each prognostic stage.
+        #  This would allow for different numbers of steps for each stage.
+        #  More importantly, it would allow us to initialize the pipeline in the constructor.
+        logger.info(f"Adding input to pipeline for {nsteps} steps")
         try:
-            # Set up queues based on input tensor size
-            with annotate("pipeline_setup_queues"):
-                self._setup_queues(x)
+            # Initialize pipeline if needed
+            # Should probably be done in the constructor
+            # TODO: Add a method to initialize the pipeline
+            # Needs to make sure that the IO backends are initialized
+            #  with the correct coordinates if working with batches.
+            self._initialize_pipeline(x, coords, nsteps)
 
-            # Initialize IO backends
-            with annotate("pipeline_initialize_io_backend"):
-                self._initialize_io_backend(
-                    self.prognostic_stages,
-                    self.diagnostic_stages,
-                    self.io_stages,
-                    nsteps,
-                    coords,
-                )
-
-            # Initialize prognostic stages
-            with annotate("pipeline_initialize_prognostic_stages"):
-                for prog_stage in self.prognostic_stages.values():
-                    x_, coords_ = map_coords(x, coords, prog_stage.model.input_coords())
-                    prog_stage.initialize(x_, coords_)
-
-            # Start diagnostic and IO stages
-            futures = [  # noqa: F841
-                self.executor.submit(stage.run)
-                for stage in (
-                    list(self.diagnostic_stages.values())
-                    + list(self.io_stages.values())
-                )
-            ]
-
-            # Run prognostic stages for requested steps
-            with annotate("pipeline_run_prognostic_stages"):
-                for step in range(nsteps + 1):  # +1 for initial condition
-                    logger.info(f"Processing step {step}/{nsteps}")
-                    for prog_stage in self.prognostic_stages.values():
-                        if not prog_stage.step():
-                            break
-
+            # Add input to prognostic stages
             for prog_stage in self.prognostic_stages.values():
-                prog_stage._signal_completion()
-
-            # Wait for completion or timeout
-            if not self._wait_for_completion():
-                logger.error("Pipeline timed out waiting for completion")
-                raise TimeoutError("Pipeline execution timed out")
-
-            logger.info("Pipeline execution completed successfully")
+                x_, coords_ = map_coords(x, coords, prog_stage.models[0].input_coords())
+                prog_stage.run(x_, coords_, nsteps)
 
         except Exception as e:
-            logger.error(f"Pipeline execution failed: {e}")
-            # Stop all stages
-            all_stages = (
-                list(self.prognostic_stages.values())
-                + list(self.diagnostic_stages.values())
-                + list(self.io_stages.values())
-            )
-            for stage in all_stages:
-                stage.stop_event.set()
+            logger.error(f"Error adding input to pipeline: {e}")
+            self.stop()
             raise e
 
-        finally:
-            # Clean up executor
-            self.executor.shutdown(wait=False)
+    def join(self, timeout: float = None) -> bool:
+        """Wait for all stages to complete processing.
+
+        Args:
+            timeout: Maximum time to wait in seconds. None means wait indefinitely.
+
+        Returns:
+            True if all processing completed successfully, False if timeout occurred.
+        """
+        if not self._is_running:
+            return True
+
+        try:
+            start_time = time.time()
+            while timeout is None or time.time() - start_time < timeout:
+                # Check for errors in diagnostic/IO stages
+                for future in self._diagnostic_futures:
+                    if future.done():
+                        # Propagate any exceptions
+                        future.result()
+
+                # Wait for prognostic stages to complete
+                for prog_stage in self.prognostic_stages.values():
+                    for device_idx in range(len(prog_stage.device)):
+                        prog_stage.work_queue[device_idx].join()
+
+                # Signal completion to downstream stages
+                for prog_stage in self.prognostic_stages.values():
+                    prog_stage._signal_completion()
+
+                # Wait for diagnostic/IO stages
+                if self._wait_for_completion(timeout=30.0):
+                    self._is_running = False
+                    return True
+
+                time.sleep(0.1)
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Error waiting for pipeline completion: {e}")
+            self.stop()
+            raise e
+
+    def stop(self) -> None:
+        """Stop all pipeline processing."""
+        logger.info("Stopping pipeline")
+        # Stop all stages
+        all_stages = (
+            list(self.prognostic_stages.values())
+            + list(self.diagnostic_stages.values())
+            + list(self.io_stages.values())
+        )
+        for stage in all_stages:
+            stage.stop_event.set()
+
+        # Clean up executor
+        self.executor.shutdown(wait=False)
+        self._is_running = False
 
     def get_metrics(self) -> dict[str, dict[str, float]]:
         """Get performance metrics for all stages."""

@@ -18,10 +18,11 @@ from dataclasses import dataclass, field
 
 import torch
 
+from earth2studio.distributed.load_balancing import LoadBalancer
 from earth2studio.io import IOBackend
 from earth2studio.models.dx import DiagnosticModel
 from earth2studio.models.px import PrognosticModel
-from earth2studio.utils.type import CoordSystem
+from earth2studio.utils.coords import CoordSystem
 
 
 @dataclass
@@ -29,7 +30,20 @@ class StageConfig:
     """Base configuration for a pipeline stage."""
 
     name: str
-    device: str | torch.device
+    device: (
+        str | torch.device | list[str | torch.device]
+    )  # Single device or list of devices
+    load_balancing: LoadBalancer
+
+    def __post_init__(self) -> None:
+        # Convert single device to list for uniform handling
+        if not isinstance(self.device, list):
+            self.device = [self.device]
+
+        # Convert string device specifications to torch.device objects
+        self.device = [
+            torch.device(dev) if isinstance(dev, str) else dev for dev in self.device
+        ]
 
 
 @dataclass
@@ -40,8 +54,21 @@ class PrognosticConfig(StageConfig):
     output_stages: list[str] = field(
         default_factory=list
     )  # Names of stages to send output to
-    stream: torch.cuda.Stream | None = None
+    streams: list[torch.cuda.Stream | None] = field(
+        default_factory=list
+    )  # One stream per device
     output_queue_size: int = 0  # 0 means infinite queue size
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # Initialize streams list if not provided
+        if not self.streams:
+            self.streams = [None] * len(self.device)
+        # Validate streams length matches devices
+        if len(self.streams) != len(self.device):
+            raise ValueError(
+                f"Number of streams ({len(self.streams)}) must match number of devices ({len(self.device)})"
+            )
 
 
 @dataclass
@@ -53,8 +80,21 @@ class DiagnosticConfig(StageConfig):
     output_stages: list[str] = field(
         default_factory=list
     )  # Names of stages to send output to
-    stream: torch.cuda.Stream | None = None
+    streams: list[torch.cuda.Stream | None] = field(
+        default_factory=list
+    )  # One stream per device
     output_queue_size: int = 0  # 0 means infinite queue size
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # Initialize streams list if not provided
+        if not self.streams:
+            self.streams = [None] * len(self.device)
+        # Validate streams length matches devices
+        if len(self.streams) != len(self.device):
+            raise ValueError(
+                f"Number of streams ({len(self.streams)}) must match number of devices ({len(self.device)})"
+            )
 
 
 @dataclass
@@ -65,11 +105,11 @@ class IOConfig(StageConfig):
     input_stages: list[str]  # Names of stages to receive input from
     array_name: str | None = None
     split_variable_key: str | None = "variable"
-    memory_fraction: float = 0.9  # Maximum GPU memory fraction to use
     output_coords: CoordSystem = field(default_factory=OrderedDict)
     _is_initialized: bool = False
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.array_name is None and self.split_variable_key is None:
             raise ValueError("Either array_name or split_variable_key must be provided")
 
@@ -140,5 +180,5 @@ class PipelineConfig:
 
         # Validate device configurations
         for stage in self.prognostic_stages + self.diagnostic_stages + self.io_stages:
-            if isinstance(stage.device, str):
-                stage.device = torch.device(stage.device)
+            if isinstance(stage.device[0], str):
+                stage.device = [torch.device(dev) for dev in stage.device]

@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import time
 from collections import OrderedDict
 from queue import Queue
 
@@ -26,6 +27,7 @@ from earth2studio.distributed.config import (
     PipelineConfig,
     PrognosticConfig,
 )
+from earth2studio.distributed.load_balancing import LoadBalancingStrategy
 from earth2studio.distributed.pipeline import (
     Pipeline,
     PipelineStage,
@@ -138,7 +140,20 @@ class TestPipelineStage:
     def test_initialize(self):
         stage = PipelineStage("test", torch.device("cpu"))
         assert stage.name == "test"
-        assert stage.device == torch.device("cpu")
+        assert stage.device[0] == torch.device("cpu")
+        assert stage.input_queues == {}
+        assert stage.output_queues == {}
+
+        stage = PipelineStage("test", [torch.device("cpu")])
+        assert stage.name == "test"
+        assert stage.device[0] == torch.device("cpu")
+        assert stage.input_queues == {}
+        assert stage.output_queues == {}
+
+        stage = PipelineStage("test", ["cpu", "cuda:0"])
+        assert stage.name == "test"
+        assert stage.device[0] == torch.device("cpu")
+        assert stage.device[1] == torch.device("cuda:0")
         assert stage.input_queues == {}
         assert stage.output_queues == {}
 
@@ -176,13 +191,13 @@ class TestPipelineStage:
 
     def test_get_memory_usage(self):
         stage = PipelineStage("test", torch.device("cpu"))
-        assert stage.get_memory_usage() == 0.0
+        assert stage.get_memory_usage(torch.device("cpu")) == 0.0
 
     def test_get_memory_usage_cuda(self):
         stage = PipelineStage("test", torch.device("cuda:0"))
         a = torch.tensor([1, 2, 3], device="cuda:0")
         a.share_memory_()
-        assert stage.get_memory_usage() > 0.0
+        assert stage.get_memory_usage(torch.device("cuda:0")) > 0.0
 
 
 class TestConfig:
@@ -470,7 +485,7 @@ class TestPipeline:
                     device=device,
                     model=prog_model,
                     output_stages=["diag"],
-                    stream=stream1,
+                    streams=[stream1],
                 )
             ],
             diagnostic_stages=[
@@ -480,7 +495,7 @@ class TestPipeline:
                     model=IdentityDiagnostic(),
                     input_stages=["prog"],
                     output_stages=["io"],
-                    stream=stream2,
+                    streams=[stream2],
                 )
             ],
             io_stages=[
@@ -496,6 +511,52 @@ class TestPipeline:
         pipeline = Pipeline(config)
         print("starting pipeline")
         pipeline(input_tensor, base_coords, nsteps=1)
+        assert pipeline.join(timeout=30.0)
+        print("pipeline finished")
+        metrics = pipeline.get_metrics()
+        print("metrics", metrics)
+        assert "prog" in metrics
+        assert "diag" in metrics
+        assert "io" in metrics
+
+        prog_model = Persistence(base_coords["variable"], domain_coords)
+        stream1 = torch.cuda.Stream(device=device)
+        stream2 = torch.cuda.Stream(device=device)
+        stream3 = torch.cuda.Stream(device=device)
+        config = PipelineConfig(
+            prognostic_stages=[
+                PrognosticConfig(
+                    name="prog",
+                    device=[device, device],
+                    model=prog_model,
+                    output_stages=["diag"],
+                    streams=[stream1, stream2],
+                )
+            ],
+            diagnostic_stages=[
+                DiagnosticConfig(
+                    name="diag",
+                    device=device,
+                    model=IdentityDiagnostic(),
+                    input_stages=["prog"],
+                    output_stages=["io"],
+                    streams=[stream3],
+                )
+            ],
+            io_stages=[
+                IOConfig(
+                    name="io",
+                    device=device,
+                    backend=ZarrBackend(),
+                    input_stages=["diag"],
+                )
+            ],
+        )
+
+        pipeline = Pipeline(config)
+        print("starting pipeline")
+        pipeline(input_tensor, base_coords, nsteps=1)
+        assert pipeline.join(timeout=30.0)
         print("pipeline finished")
         metrics = pipeline.get_metrics()
         print("metrics", metrics)
@@ -535,7 +596,7 @@ class TestPipeline:
             ],
         )
         pipeline = Pipeline(config)
-        pipeline._setup_queues(input_tensor)
+        pipeline._setup_queues()
 
         total_coords = pipeline._determine_io_backend_coords(
             pipeline.prognostic_stages,
@@ -590,7 +651,7 @@ class TestPipeline:
             ],
         )
         pipeline = Pipeline(config)
-        pipeline._setup_queues(input_tensor)
+        pipeline._setup_queues()
         total_coords = pipeline._determine_io_backend_coords(
             pipeline.prognostic_stages,
             pipeline.diagnostic_stages,
@@ -640,7 +701,7 @@ class TestPipeline:
             ],
         )
         pipeline = Pipeline(config)
-        pipeline._setup_queues(input_tensor)
+        pipeline._setup_queues()
         total_coords = pipeline._determine_io_backend_coords(
             pipeline.prognostic_stages,
             pipeline.diagnostic_stages,
@@ -693,6 +754,7 @@ class TestPipeline:
         pipeline = Pipeline(config)
         print("starting pipeline")
         pipeline(input_tensor, base_coords, nsteps=1)
+        assert pipeline.join(timeout=30.0)
         print("pipeline finished")
         metrics = pipeline.get_metrics()
         print("metrics", metrics)
@@ -743,6 +805,7 @@ class TestPipeline:
 
         pipeline = Pipeline(config)
         pipeline(input_tensor, base_coords, nsteps=1)
+        assert pipeline.join(timeout=30.0)
 
         metrics = pipeline.get_metrics()
         assert len(metrics) == 4  # prog + 2 diag + io
@@ -799,6 +862,7 @@ class TestPipeline:
 
         pipeline = Pipeline(config)
         pipeline(input_tensor, base_coords, nsteps=1)
+        assert pipeline.join(timeout=30.0)
         # Check results
         assert np.allclose(io1["t2m"][:] * 0.5, io2["t2m"][:] * 2.0)
 
@@ -821,3 +885,281 @@ class TestPipeline:
                 io_stages=[],
             )
             Pipeline(config)
+
+    def test_pipeline_multi_device(
+        self, input_tensor, base_coords, domain_coords, device
+    ):
+        """Test pipeline with multiple devices."""
+        prog_model = Persistence(base_coords["variable"], domain_coords)
+
+        config = PipelineConfig(
+            prognostic_stages=[
+                PrognosticConfig(
+                    name="prog", device=device, model=prog_model, output_stages=["diag"]
+                )
+            ],
+            diagnostic_stages=[
+                DiagnosticConfig(
+                    name="diag",
+                    device=[device, device],
+                    model=IdentityDiagnostic(),
+                    input_stages=["prog"],
+                    output_stages=["io"],
+                )
+            ],
+            io_stages=[
+                IOConfig(
+                    name="io",
+                    device="cpu",
+                    backend=ZarrBackend(),
+                    input_stages=["diag"],
+                )
+            ],
+        )
+
+        pipeline = Pipeline(config)
+        print("starting pipeline")
+        pipeline(input_tensor, base_coords, nsteps=8)
+        assert pipeline.join(timeout=30.0)
+        print("pipeline finished")
+        metrics = pipeline.get_metrics()
+        print("metrics", metrics)
+        assert "prog" in metrics
+        assert "diag" in metrics
+        assert "io" in metrics
+
+
+@pytest.fixture
+def multi_device():
+    """Get list of available devices for testing."""
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.extend([f"cuda:{i}" for i in range(torch.cuda.device_count())])
+    return devices
+
+
+class TestMultiDevicePipeline:
+    """Test cases for multi-device pipeline functionality."""
+
+    def test_multi_device_prognostic(
+        self, input_tensor, base_coords, domain_coords, multi_device
+    ):
+        """Test prognostic stage with multiple devices."""
+        prog_model = Persistence(base_coords["variable"], domain_coords)
+        io = ZarrBackend()
+        config = PipelineConfig(
+            prognostic_stages=[
+                PrognosticConfig(
+                    name="prog",
+                    device=multi_device[:2],  # Use first two available devices
+                    model=prog_model,
+                    output_stages=["diag"],
+                    load_balancing=LoadBalancingStrategy.ROUND_ROBIN,
+                )
+            ],
+            diagnostic_stages=[
+                DiagnosticConfig(
+                    name="diag",
+                    device="cpu",
+                    model=IdentityDiagnostic(),
+                    input_stages=["prog"],
+                    output_stages=["io"],
+                )
+            ],
+            io_stages=[
+                IOConfig(
+                    name="io",
+                    device="cpu",
+                    backend=io,
+                    input_stages=["diag"],
+                )
+            ],
+        )
+
+        pipeline = Pipeline(config)
+        pipeline(
+            input_tensor, base_coords, nsteps=4
+        )  # Run multiple steps to test load balancing
+        assert pipeline.join(timeout=30.0)
+
+        assert io["t2m"].shape == (5, 10, 20)
+        assert np.all(~np.isnan(io["t2m"][:, 0, 0]))
+        assert np.all(io["t2m"][:, 0, 0] != 0.0)
+
+    def test_multi_device_diagnostic(
+        self, input_tensor, base_coords, domain_coords, multi_device
+    ):
+        """Test diagnostic stage with multiple devices."""
+        prog_model = Persistence(base_coords["variable"], domain_coords)
+        io = ZarrBackend()
+        config = PipelineConfig(
+            prognostic_stages=[
+                PrognosticConfig(
+                    name="prog",
+                    device="cpu",
+                    model=prog_model,
+                    output_stages=["diag"],
+                )
+            ],
+            diagnostic_stages=[
+                DiagnosticConfig(
+                    name="diag",
+                    device=multi_device[:2],  # Use first two available devices
+                    model=ScalingDiagnostic(2.0),
+                    input_stages=["prog"],
+                    output_stages=["io"],
+                    load_balancing=LoadBalancingStrategy.ROUND_ROBIN,
+                )
+            ],
+            io_stages=[
+                IOConfig(
+                    name="io",
+                    device="cpu",
+                    backend=io,
+                    input_stages=["diag"],
+                )
+            ],
+        )
+
+        pipeline = Pipeline(config)
+        pipeline(input_tensor, base_coords, nsteps=4)
+        assert pipeline.join(timeout=30.0)
+
+        assert io["t2m"].shape == (5, 10, 20)
+        assert np.all(~np.isnan(io["t2m"][:, 0, 0]))
+        assert np.all(io["t2m"][:, 0, 0] != 0.0)
+
+    def test_worker_error_handling(self, input_tensor, base_coords, domain_coords):
+        """Test error handling in worker threads."""
+
+        class ErrorModel(IdentityDiagnostic):
+            def __call__(self, x, coords):
+                raise RuntimeError("Simulated error")
+
+        config = PipelineConfig(
+            prognostic_stages=[
+                PrognosticConfig(
+                    name="prog",
+                    device=["cpu", "cpu"],  # Use two CPU devices
+                    model=Persistence(base_coords["variable"], domain_coords),
+                    output_stages=["diag"],
+                )
+            ],
+            diagnostic_stages=[
+                DiagnosticConfig(
+                    name="diag",
+                    device=["cpu", "cpu"],
+                    model=ErrorModel(),
+                    input_stages=["prog"],
+                    output_stages=["io"],
+                )
+            ],
+            io_stages=[
+                IOConfig(
+                    name="io",
+                    device="cpu",
+                    backend=ZarrBackend(),
+                    input_stages=["diag"],
+                )
+            ],
+        )
+
+        pipeline = Pipeline(config)
+        pipeline(input_tensor, base_coords, nsteps=1)
+        with pytest.raises(Exception, match="Simulated error"):
+            pipeline.join(timeout=30.0)
+
+    def test_queue_management(self, input_tensor, base_coords, domain_coords):
+        """Test queue management with multiple devices."""
+
+        class SlowModel(IdentityDiagnostic):
+            def __call__(self, x, coords):
+                time.sleep(0.1)  # Simulate slow processing
+                return super().__call__(x, coords)
+
+        io = ZarrBackend()
+        config = PipelineConfig(
+            prognostic_stages=[
+                PrognosticConfig(
+                    name="prog",
+                    device="cpu",
+                    model=Persistence(base_coords["variable"], domain_coords),
+                    output_stages=["diag"],
+                    output_queue_size=2,  # Limited queue size
+                )
+            ],
+            diagnostic_stages=[
+                DiagnosticConfig(
+                    name="diag",
+                    device=["cpu", "cpu"],  # Use two CPU devices
+                    model=SlowModel(),
+                    input_stages=["prog"],
+                    output_stages=["io"],
+                    load_balancing=LoadBalancingStrategy.LEAST_BUSY,
+                )
+            ],
+            io_stages=[
+                IOConfig(
+                    name="io",
+                    device="cpu",
+                    backend=io,
+                    input_stages=["diag"],
+                )
+            ],
+        )
+
+        pipeline = Pipeline(config)
+        pipeline(input_tensor, base_coords, nsteps=4)
+        assert pipeline.join(timeout=30.0)
+
+        # Check that work was distributed across devices
+        assert io["t2m"].shape == (5, 10, 20)
+        assert np.all(~np.isnan(io["t2m"][:, 0, 0]))
+        assert np.all(io["t2m"][:, 0, 0] != 0.0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_streams(self, input_tensor, base_coords, domain_coords):
+        """Test pipeline with CUDA streams on multiple devices."""
+        streams = [torch.cuda.Stream() for _ in range(2)]
+        io = ZarrBackend()
+        config = PipelineConfig(
+            prognostic_stages=[
+                PrognosticConfig(
+                    name="prog",
+                    device=(
+                        ["cuda:0", "cuda:1"]
+                        if torch.cuda.device_count() > 1
+                        else ["cuda:0", "cuda:0"]
+                    ),
+                    model=Persistence(base_coords["variable"], domain_coords),
+                    output_stages=["diag"],
+                    streams=streams,
+                    load_balancing=LoadBalancingStrategy.MEMORY_AWARE,
+                )
+            ],
+            diagnostic_stages=[
+                DiagnosticConfig(
+                    name="diag",
+                    device="cpu",
+                    model=IdentityDiagnostic(),
+                    input_stages=["prog"],
+                    output_stages=["io"],
+                )
+            ],
+            io_stages=[
+                IOConfig(
+                    name="io",
+                    device="cpu",
+                    backend=io,
+                    input_stages=["diag"],
+                )
+            ],
+        )
+
+        pipeline = Pipeline(config)
+        pipeline(input_tensor, base_coords, nsteps=4)
+        assert pipeline.join(timeout=30.0)
+
+        assert io["t2m"].shape == (5, 10, 20)
+        assert np.all(~np.isnan(io["t2m"][:, 0, 0]))
+        assert np.all(io["t2m"][:, 0, 0] != 0.0)
