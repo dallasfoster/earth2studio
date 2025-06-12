@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from earth2studio.distributed.load_balancing import LoadBalancer
+from earth2studio.distributed.load_balancing import LoadBalancer, RoundRobinBalancer
 from earth2studio.io import IOBackend
 from earth2studio.models.dx import DiagnosticModel
 from earth2studio.models.px import PrognosticModel
@@ -33,7 +33,6 @@ class StageConfig:
     device: (
         str | torch.device | list[str | torch.device]
     )  # Single device or list of devices
-    load_balancing: LoadBalancer
 
     def __post_init__(self) -> None:
         # Convert single device to list for uniform handling
@@ -58,6 +57,7 @@ class PrognosticConfig(StageConfig):
         default_factory=list
     )  # One stream per device
     output_queue_size: int = 0  # 0 means infinite queue size
+    load_balancing: LoadBalancer = RoundRobinBalancer
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -84,6 +84,7 @@ class DiagnosticConfig(StageConfig):
         default_factory=list
     )  # One stream per device
     output_queue_size: int = 0  # 0 means infinite queue size
+    load_balancing: LoadBalancer = RoundRobinBalancer
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -107,6 +108,7 @@ class IOConfig(StageConfig):
     split_variable_key: str | None = "variable"
     output_coords: CoordSystem = field(default_factory=OrderedDict)
     _is_initialized: bool = False
+    load_balancing: LoadBalancer = RoundRobinBalancer
 
     def __post_init__(self) -> None:
         super().__post_init__()

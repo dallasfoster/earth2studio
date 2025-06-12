@@ -27,7 +27,11 @@ from earth2studio.distributed.config import (
     PipelineConfig,
     PrognosticConfig,
 )
-from earth2studio.distributed.load_balancing import LoadBalancingStrategy
+from earth2studio.distributed.load_balancing import (
+    LeastBusyBalancer,
+    MemoryAwareBalancer,
+    RoundRobinBalancer,
+)
 from earth2studio.distributed.pipeline import (
     Pipeline,
     PipelineStage,
@@ -954,7 +958,7 @@ class TestMultiDevicePipeline:
                     device=multi_device[:2],  # Use first two available devices
                     model=prog_model,
                     output_stages=["diag"],
-                    load_balancing=LoadBalancingStrategy.ROUND_ROBIN,
+                    load_balancing=RoundRobinBalancer,
                 )
             ],
             diagnostic_stages=[
@@ -1008,7 +1012,7 @@ class TestMultiDevicePipeline:
                     model=ScalingDiagnostic(2.0),
                     input_stages=["prog"],
                     output_stages=["io"],
-                    load_balancing=LoadBalancingStrategy.ROUND_ROBIN,
+                    load_balancing=RoundRobinBalancer,
                 )
             ],
             io_stages=[
@@ -1095,7 +1099,7 @@ class TestMultiDevicePipeline:
                     model=SlowModel(),
                     input_stages=["prog"],
                     output_stages=["io"],
-                    load_balancing=LoadBalancingStrategy.LEAST_BUSY,
+                    load_balancing=LeastBusyBalancer,
                 )
             ],
             io_stages=[
@@ -1134,7 +1138,7 @@ class TestMultiDevicePipeline:
                     model=Persistence(base_coords["variable"], domain_coords),
                     output_stages=["diag"],
                     streams=streams,
-                    load_balancing=LoadBalancingStrategy.MEMORY_AWARE,
+                    load_balancing=MemoryAwareBalancer,
                 )
             ],
             diagnostic_stages=[
